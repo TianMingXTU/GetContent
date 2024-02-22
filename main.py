@@ -1,161 +1,194 @@
+import logging
+import time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox, ttk, Menu
 import threading
-
 import requests
 from moviepy.editor import VideoFileClip
 import speech_recognition as sr
 import os
-from tkinter import font as tkFont
+import json
+from PIL import Image, ImageTk
 
-base_url = ''
-key = ''
-# 假设 summarize_text 函数已定义并可用
-def summarize_text(text):
-    headers = {
-        'Authorization': f'Bearer {key}',
-        'Content-Type': 'application/json',
-    }
-
-    # print(org)
-    prompt = '假如你是一名伟大的文字总结大师，请你帮我总结后面的文字。'
-    print(prompt + text)
-    json_data = {
-        'model': 'gpt-3.5-turbo',
-        'messages': [
-            {
-                'role': 'user',
-                'content': prompt + text,
-            },
-        ],
-        'stream': False,
-    }
-
-    response = requests.post(base_url, headers=headers,
-                             json=json_data)
-    result = response.json()
-    content = result['choices'][0]['message']['content']
-    return content
+# Setup logging
+logging.basicConfig(filename='app.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def extract_audio_from_video(video_file_path, audio_file_path="temp_audio.wav"):
+def load_config():
+    # Load configuration from a JSON file
+    config_path = "config.json"
     try:
-        video = VideoFileClip(video_file_path)
-        video.audio.write_audiofile(audio_file_path)
-        video.close()
-        return audio_file_path
+        with open(config_path, 'r') as config_file:
+            return json.load(config_file)
     except Exception as e:
-        messagebox.showerror("错误", f"提取音频失败: {e}")
+        messagebox.showerror("Configuration Error", f"Failed to load configuration: {e}")
+        exit()
+
+
+config = load_config()
+base_url = config.get("base_url", "")
+key = config.get("key", "")
+
+
+def save_results_to_json(original_text, summary_text):
+    timestamp = int(time.time())
+    file_name = f"summary_{timestamp}.json"
+    data = {
+        "original_text": original_text,
+        "summary": summary_text
+    }
+    with open(file_name, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    print(f"Results saved to {file_name}")
+
+
+def create_right_click_menu(widget):
+    # Create a right-click context menu for copying text
+    def copy():
+        widget.event_generate("<<Copy>>")
+
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Copy", command=copy)
+
+    def show_menu(event):
+        menu.post(event.x_root, event.y_root)
+
+    widget.bind("<Button-3>", show_menu)
+
+
+def summarize_text(text, progress_callback):
+    try:
+        prom = "假如你是一名伟大的文字总结大师，请你帮我总结后面的文字。\n"
+        headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', }
+        data = {'model': 'gpt-3.5-turbo', 'messages': [{'role': 'user', 'content': prom + text}], 'stream': False}
+        response = requests.post(base_url, headers=headers, json=data)
+        result = response.json()
+        progress_callback(100)
+        return result['choices'][0]['message']['content']
+    except Exception as e:
+        logging.error(f"Error summarizing text: {e}")
+        messagebox.showerror("Error", "Failed to summarize text.")
         return None
 
 
-def process_audio(audio_file_path):
+def extract_audio_from_video(video_path, audio_path="temp_audio.wav", progress_callback=lambda x: None):
+    try:
+        clip = VideoFileClip(video_path)
+        clip.audio.write_audiofile(audio_path)
+        clip.close()
+        progress_callback(20)  # Assume audio extraction is 20% of the work
+        return audio_path
+    except Exception as e:
+        logging.error(f"Failed to extract audio: {e}")
+        messagebox.showerror("Error", "Failed to extract audio.")
+        return None
+
+
+def recognize_audio(audio_path, progress_callback):
     try:
         recognizer = sr.Recognizer()
-        with sr.AudioFile(audio_file_path) as source:
+        with sr.AudioFile(audio_path) as source:
             audio_data = recognizer.record(source)
+            progress_callback(50)  # Assume speech recognition is up to 50% of the work
             text = recognizer.recognize_google(audio_data, language='zh-CN')
+            progress_callback(80)  # Speech recognition done
             return text
     except Exception as e:
-        messagebox.showerror("错误", f"语音识别失败: {e}")
+        logging.error(f"Failed to recognize speech: {e}")
+        messagebox.showerror("Error", "Failed to recognize speech.")
         return None
 
 
-def create_popup_menu(widget):
-    """为文本框创建右键弹出菜单"""
-    popup_menu = Menu(widget, tearoff=0)
-    popup_menu.add_command(label="复制", command=lambda: widget.event_generate("<<Copy>>"))
-    popup_menu.add_separator()
-    popup_menu.add_command(label="清空", command=lambda: widget.delete('1.0', tk.END))
+def setup_gui(root, progress_var):
+    root.title("内容总结器")
+    root.geometry("800x600")
 
-    def popup(event):
-        try:
-            popup_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            popup_menu.grab_release()
-
-    widget.bind("<Button-3>", popup)  # Windows上为<Button-3>
-    # 如果是在macOS上，可能需要改为<Button-2>
-
-
-def update_gif(index=0):
-    """循环显示GIF动画帧"""
-    if processing_video:  # 检查是否仍在处理视频
-        frame = gif_frames[index]
-        index = (index + 1) % len(gif_frames)
-        gif_label.configure(image=frame)
-        root.after(100, update_gif, index)  # 每100ms更新一次帧
-    else:
-        gif_label.grid_remove()  # 处理完成后隐藏GIF动画
-
-
-def process_file_thread(file_type):
-    global processing_video
-    processing_video = True  # 开始处理时设置为True
-    gif_label.grid(row=4, column=0, columnspan=2)  # 显示等待动画
-    update_gif()  # 启动动画
-    file_path = file_path_var.get()
-    if file_type == '视频':
-        audio_path = extract_audio_from_video(file_path)
-    else:
-        audio_path = file_path  # 直接使用上传的音频文件
-    if audio_path:
-        text = process_audio(audio_path)
-        if text:
-            summary = summarize_text(text)
-            result_text.delete('1.0', tk.END)
-            result_text.insert(tk.END, f"原文:\n{text}\n\n总结:\n{summary}")
-        if file_type == '视频':
-            os.remove(audio_path)  # 清理临时音频文件
-    processing_video = False  # 处理结束时设置为False
-
-
-def process_file(file_type):
-    threading.Thread(target=process_file_thread, args=(file_type,), daemon=True).start()
-
-
-def choose_file():
-    file_type = file_type_var.get()
-    file_types = [('所有文件', '*.*')]
-    if file_type == '视频':
-        file_types = [('视频文件', '*.mp4 *.avi *.mov')]
-    elif file_type == '音频':
-        file_types = [('音频文件', '*.mp3 *.wav *.aac')]
-    file_path = filedialog.askopenfilename(filetypes=file_types)
-    file_path_var.set(file_path)
-
-
-def setup_gui(root):
-    root.title("视频内容总结器")
-    ttk.Label(root, text="选择文件类型:").grid(row=0, column=0, padx=10, pady=5, sticky='w')
+    # 文件类型选择
+    ttk.Label(root, text="文件类型:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
+    file_type_var = tk.StringVar(value='视频')
     ttk.Combobox(root, textvariable=file_type_var, values=['视频', '音频'], state="readonly").grid(row=0, column=1,
-                                                                                                   sticky="ew", padx=10,
-                                                                                                   pady=5)
-    ttk.Button(root, text="选择文件", command=choose_file).grid(row=1, column=0, columnspan=2, sticky="ew", padx=10,
-                                                                pady=5)
-    ttk.Button(root, text="处理", command=lambda: process_file(file_type_var.get())).grid(row=2, column=0, columnspan=2,
-                                                                                          sticky="ew", padx=10, pady=5)
-    ttk.Progressbar(root, variable=progress_var, maximum=1).grid(row=3, column=0, columnspan=2, sticky="ew", padx=10,
-                                                                 pady=5)
-    result_text.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=10, pady=5)
+                                                                                                   padx=10, pady=10,
+                                                                                                   sticky='ew')
+
+    # 选择多个文件按钮
+    ttk.Button(root, text="选择多个文件", command=lambda: select_files(file_type_var)).grid(row=1, column=0,
+                                                                                            columnspan=2, padx=10,
+                                                                                            pady=10, sticky='ew')
+
+    # 进度条
+    progress_bar = ttk.Progressbar(root, orient='horizontal', mode='determinate', variable=progress_var)
+    progress_bar.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
+
+    # 结果显示文本框
+    result_text = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    result_text.grid(row=3, column=0, columnspan=2, padx=10, pady=10, sticky='nsew')
+
+    # 开始处理按钮
+    ttk.Button(root, text="开始处理",
+               command=lambda: start_processing(file_type_var.get(), result_text, progress_var)).grid(row=4,
+                                                                                                      column=0,
+                                                                                                      columnspan=2,
+                                                                                                      padx=10,
+                                                                                                      pady=10,
+                                                                                                      sticky='ew')
+
     root.grid_columnconfigure(0, weight=1)
-    root.grid_columnconfigure(1, weight=1)
-    root.grid_rowconfigure(5, weight=1)
-    create_popup_menu(result_text)
+    root.grid_rowconfigure(3, weight=1)
+
+    create_right_click_menu(result_text)
 
 
-root = tk.Tk()
-root.geometry("600x400")
-file_path_var = tk.StringVar()
-# 确保字体已经安装在系统中，然后使用字体的名称
-custom_font = tkFont.Font(family="STKAITI.TTF", size=12)
-file_type_var = tk.StringVar(value='视频')  # 默认值为'视频'
-progress_var = tk.DoubleVar()
-result_text = scrolledtext.ScrolledText(root, height=20)
-result_text.configure(font=custom_font)
-gif_frames = [tk.PhotoImage(file='111.gif', format=f'gif -index {i}') for i in range(5)]  # 更新为正确的GIF帧数和文件名
-gif_label = tk.Label(root)
+selected_files = []
 
-setup_gui(root)
 
-root.mainloop()
+def select_files(file_type_var):
+    global selected_files
+    file_types = [('所有文件', '*.*')] if file_type_var.get() == '音频' else [('视频文件', '*.mp4 *.avi *.mov'),
+                                                                              ('音频文件', '*.mp3 *.wav')]
+    selected_files = filedialog.askopenfilenames(filetypes=file_types)
+    if selected_files:
+        messagebox.showinfo("文件选择", f"已选择{len(selected_files)}个文件")
+
+
+def start_processing(file_type, result_text, progress_var):
+    if not selected_files:
+        messagebox.showerror("错误", "未选择任何文件")
+        return
+    for file_path in selected_files:
+        threading.Thread(target=process_file, args=(file_path, file_type, result_text, progress_var),
+                         daemon=True).start()
+
+
+def process_file(file_path, file_type, result_text, progress_var):
+    def update_progress(progress):
+        progress_var.set(progress)
+
+    try:
+        update_progress(0)
+        audio_path = extract_audio_from_video(file_path,
+                                              progress_callback=update_progress) if file_type == '视频' else file_path
+        if audio_path:
+            recognized_text = recognize_audio(audio_path, progress_callback=update_progress)
+            if recognized_text:
+                summary = summarize_text(recognized_text, progress_callback=update_progress)
+                if summary:
+                    result_text.delete('1.0', tk.END)
+                    result_text.insert(tk.END, f"原文:\n{recognized_text}\n\n总结:\n{summary}")
+                    save_results_to_json(recognized_text, summary)  # Save results to JSON
+                if file_type == '视频' and audio_path != file_path:
+                    os.remove(audio_path)
+            update_progress(100)
+    except Exception as e:
+        logging.error(f"Failed to process file: {e}")
+        messagebox.showerror("Error", "An error occurred during file processing.")
+
+
+def main():
+    root = tk.Tk()
+    progress_var = tk.DoubleVar()
+    setup_gui(root, progress_var)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
