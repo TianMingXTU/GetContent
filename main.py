@@ -1,3 +1,4 @@
+import datetime
 import logging
 import time
 import tkinter as tk
@@ -8,7 +9,7 @@ from moviepy.editor import VideoFileClip
 import speech_recognition as sr
 import os
 import json
-from PIL import Image, ImageTk
+from aip import AipSpeech
 
 # Setup logging
 logging.basicConfig(filename='app.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,11 +29,16 @@ def load_config():
 config = load_config()
 base_url = config.get("base_url", "")
 key = config.get("key", "")
+BAIDU_APP_ID = config.get("BAIDU_APP_ID", "")
+BAIDU_API_KEY = config.get("BAIDU_API_KEY", "")
+BAIDU_SECRET_KEY = config.get("BAIDU_SECRET_KEY", "")
+BAIDU_TYPE = config.get("BAIDU_TYPE", "False")
 
 
 def save_results_to_json(original_text, summary_text):
-    timestamp = int(time.time())
-    file_name = f"summary_{timestamp}.json"
+    current_datetime = datetime.datetime.now()
+    formatted_datetime = current_datetime.strftime("%Y-%m-%d_%H-%M-%S")
+    file_name = f"summary_{formatted_datetime}.json"
     data = {
         "original_text": original_text,
         "summary": summary_text
@@ -58,6 +64,7 @@ def create_right_click_menu(widget):
 
 def summarize_text(text, progress_callback):
     try:
+        time.sleep(5)
         prom = "假如你是一名伟大的文字总结大师，请你帮我总结后面的文字。\n"
         headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', }
         data = {'model': 'gpt-3.5-turbo', 'messages': [{'role': 'user', 'content': prom + text}], 'stream': False}
@@ -71,12 +78,17 @@ def summarize_text(text, progress_callback):
         return None
 
 
+from pydub import AudioSegment
+
+
 def extract_audio_from_video(video_path, audio_path="temp_audio.wav", progress_callback=lambda x: None):
     try:
+        # Process as before for other video formats
         clip = VideoFileClip(video_path)
         clip.audio.write_audiofile(audio_path)
         clip.close()
         progress_callback(20)  # Assume audio extraction is 20% of the work
+
         return audio_path
     except Exception as e:
         logging.error(f"Failed to extract audio: {e}")
@@ -84,19 +96,62 @@ def extract_audio_from_video(video_path, audio_path="temp_audio.wav", progress_c
         return None
 
 
-def recognize_audio(audio_path, progress_callback):
-    try:
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(audio_path) as source:
-            audio_data = recognizer.record(source)
-            progress_callback(50)  # Assume speech recognition is up to 50% of the work
-            text = recognizer.recognize_google(audio_data, language='zh-CN')
-            progress_callback(80)  # Speech recognition done
-            return text
-    except Exception as e:
-        logging.error(f"Failed to recognize speech: {e}")
-        messagebox.showerror("Error", "Failed to recognize speech.")
-        return None
+def recognize_audio(audio_path, progress_callback, use_baidu=False):
+    if audio_path.endswith('.mp3'):
+        progress_callback(10)  # Indicate initial progress
+        sound = AudioSegment.from_mp3(audio_path)
+        sound.export(audio_path, format="wav")
+        progress_callback(20)  # Assume audio conversion is 20% of the work
+
+    if use_baidu:
+        # 使用百度API进行语音识别
+        print('使用百度语音识别')
+        client = AipSpeech(BAIDU_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY)
+        with open(audio_path, 'rb') as f:
+            audio_data = f.read()
+        # 假定音频文件是16KHz采样率的16位单声道音频
+        result = client.asr(audio_data, 'wav', 16000, {'dev_pid': 1537, })
+        progress_callback(80)  # Update progress
+        if result['err_no'] == 0:
+            return result['result'][0]
+        else:
+            logging.error(f"Failed to recognize speech with Baidu: {result['err_msg']}")
+            messagebox.showerror("Error", f"Failed to recognize speech with Baidu: {result['err_msg']}")
+            return None
+    else:
+        try:
+            print('使用谷歌语音识别:')
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(audio_path) as source:
+                audio_data = recognizer.record(source)
+                progress_callback(50)  # Assume speech recognition is up to 50% of the work
+                text = recognizer.recognize_google(audio_data, language='zh-CN')
+                progress_callback(80)  # Speech recognition done
+                return text
+        except Exception as e:
+            logging.error(f"Failed to recognize speech: {e}")
+            messagebox.showerror("Error", "Failed to recognize speech.")
+            return None
+
+
+def split_video(video_path, segment_duration=600):
+    """
+    将视频分割成指定时长的片段。
+    :param video_path: 视频文件路径
+    :param segment_duration: 每个片段的时长（秒）
+    :return: 分割后的视频片段文件路径列表
+    """
+    clip = VideoFileClip(video_path)
+    duration = clip.duration  # 获取视频总时长
+    segments = []
+    for start in range(0, int(duration), segment_duration):
+        end = min(start + segment_duration, duration)
+        segment_clip = clip.subclip(start, end)
+        segment_filename = f"{video_path}_segment_{start}_{end}.mp4"
+        segment_clip.write_videofile(segment_filename, codec="libx264", audio_codec="aac")
+        segments.append(segment_filename)
+    clip.close()
+    return segments
 
 
 def setup_gui(root, progress_var):
@@ -165,19 +220,31 @@ def process_file(file_path, file_type, result_text, progress_var):
 
     try:
         update_progress(0)
-        audio_path = extract_audio_from_video(file_path,
-                                              progress_callback=update_progress) if file_type == '视频' else file_path
-        if audio_path:
-            recognized_text = recognize_audio(audio_path, progress_callback=update_progress)
-            if recognized_text:
-                summary = summarize_text(recognized_text, progress_callback=update_progress)
-                if summary:
-                    result_text.delete('1.0', tk.END)
-                    result_text.insert(tk.END, f"原文:\n{recognized_text}\n\n总结:\n{summary}")
-                    save_results_to_json(recognized_text, summary)  # Save results to JSON
-                if file_type == '视频' and audio_path != file_path:
-                    os.remove(audio_path)
-            update_progress(100)
+        if file_type == '视频':
+            # 分割视频
+            segments = split_video(file_path)
+            summaries = []
+            for segment in segments:
+                audio_path = extract_audio_from_video(segment, progress_callback=update_progress)
+                if audio_path:
+                    recognized_text = recognize_audio(audio_path, progress_callback=update_progress)
+                    if recognized_text:
+                        summary = summarize_text(recognized_text, progress_callback=update_progress)
+                        if summary:
+                            summaries.append(summary)
+                        if audio_path != segment:  # 清理临时音频文件
+                            os.remove(audio_path)
+                os.remove(segment)  # 清理视频片段文件
+            # 合并片段总结并进行一次最终总结
+            combined_summary = " ".join(summaries)
+            final_summary = summarize_text(combined_summary, progress_callback=update_progress)
+            result_text.delete('1.0', tk.END)
+            result_text.insert(tk.END, f"总结:\n{final_summary}")
+            save_results_to_json(combined_summary, final_summary)
+        else:
+            # 非视频文件的处理流程保持不变
+            pass
+        update_progress(100)
     except Exception as e:
         logging.error(f"Failed to process file: {e}")
         messagebox.showerror("Error", "An error occurred during file processing.")
